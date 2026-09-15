@@ -1,0 +1,718 @@
+# DeepSeek-V4.1-Flash overlay5 GB10 patches
+# Against: vLLM 0.1.dev20904+g179dd0fa9 (dsv41-feat @ 179dd0fa9)
+# Image: vllm-dsv41:overlay5  (FROM vllm/vllm-openai:nightly-8a728663c1c3eeace834a95f5654fa653cc1998c)
+# Apply from site-packages OR vLLM source root:
+#   cd /usr/local/lib/python3.12/dist-packages && patch -p1 < overlay5-gb10.patch
+#   cd <vllm-src> && patch -p1 < overlay5-gb10.patch
+#
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -40,6 +40,12 @@
+ import torch
+ from torch import nn
+ 
++# --- Tech2Wild/Kai 2026-09-10: disk-backed Engram tables for DGX Spark (UMA) ---
++import json as _kai_json
++import os as _kai_os
++import struct as _kai_struct
++from concurrent.futures import ThreadPoolExecutor as _KaiPool
++
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.distributed import (
+     get_engram_dp_group,
+@@ -678,6 +684,202 @@
+         )
+ 
+ 
++_DSV41_ENGRAM_DISK = _kai_os.environ.get("DSV41_ENGRAM_DISK", "0") == "1"
++
++# --- Tech2Wild/Kai 2026-09-10 (CUDA graphs): one process-wide read pool shared
++# by every DiskEngramTable. A step's reads for BOTH engram layers (weight and
++# scale rows) go out as one batch, so decode latency is ~one pread instead of
++# 24 serial ones (measured on Reddie: 7.7 ms serial vs 3.1 ms parallel, C1).
++_KAI_THREADS = int(_kai_os.environ.get("DSV41_ENGRAM_DISK_THREADS", "32"))
++_KAI_CHUNK = int(_kai_os.environ.get("DSV41_ENGRAM_DISK_CHUNK", "16"))
++_KAI_POOL: _KaiPool | None = None
++
++
++def _kai_pool() -> _KaiPool:
++    global _KAI_POOL
++    if _KAI_POOL is None:
++        _KAI_POOL = _KaiPool(max_workers=_KAI_THREADS, thread_name_prefix="engram-disk")
++    return _KAI_POOL
++
++
++def _kai_pread_rows(
++    fd: int, base: int, rel: list, lo: int, hi: int, row_bytes: int, buf
++) -> None:
++    for i in range(lo, hi):
++        off = base + rel[i] * row_bytes
++        view = buf[i * row_bytes : (i + 1) * row_bytes]
++        got = 0
++        while got < row_bytes:
++            n = _kai_os.preadv(fd, [view[got:]], off + got)
++            if n <= 0:
++                raise OSError("engram disk table: short read")
++            got += n
++
++
++def _kai_parallel_read(jobs: list) -> None:
++    """jobs: [(fd, base, rel_list, row_bytes, memoryview)]. Every row of every job
++    is in flight at once: a task carries ceil(total / threads) rows (1 row at
++    decode sizes), capped at DSV41_ENGRAM_DISK_CHUNK for prefill-sized batches.
++    Only the calling thread submits, so the shared pool cannot deadlock."""
++    total = sum(len(job[2]) for job in jobs)
++    if total == 0:
++        return
++    if total == 1:
++        for fd, base, rel, row_bytes, buf in jobs:
++            _kai_pread_rows(fd, base, rel, 0, len(rel), row_bytes, buf)
++        return
++    chunk = max(1, min(_KAI_CHUNK, -(-total // _KAI_THREADS)))
++    pool = _kai_pool()
++    futs = [
++        pool.submit(
++            _kai_pread_rows, fd, base, rel, lo, min(lo + chunk, len(rel)), row_bytes, buf
++        )
++        for fd, base, rel, row_bytes, buf in jobs
++        for lo in range(0, len(rel), chunk)
++    ]
++    for fut in futs:
++        fut.result()
++
++
++def _dsv41_engram_local_dir(model_dir: str, layer_id: int, row_start: int, num_rows) -> str:
++    """Tech2Wild 2026-09-10: node-local Engram rows. DSV41_ENGRAM_DIR points at a sparse copy
++    of the Engram shards holding only this rank's rows at the original byte offsets, plus
++    engram-local.json with the copied row range per layer (tools/engram_local.py). It is used
++    only when that range covers this table's rows; otherwise the table reads model_dir as before,
++    so a changed rank map can never read the copy's empty holes."""
++    local = _kai_os.environ.get("DSV41_ENGRAM_DIR", "")
++    if not local:
++        return model_dir
++    try:
++        with open(_kai_os.path.join(local, "engram-local.json")) as f:
++            lo, hi = _kai_json.load(f)["layers"][str(layer_id)]
++    except Exception as e:  # noqa: BLE001
++        logger.warning("DSV41_ENGRAM_DIR=%s unusable for layer %d (%s); reading %s",
++                       local, layer_id, e, model_dir)
++        return model_dir
++    if num_rows is None or not (lo <= row_start and row_start + num_rows <= hi):
++        logger.warning("DSV41_ENGRAM_DIR=%s holds layer %d rows [%d, %d), this rank needs "
++                       "[%d, +%s); reading %s", local, layer_id, lo, hi, row_start, num_rows, model_dir)
++        return model_dir
++    logger.info("Engram layer %d rows [%d, %d) read from node-local %s",
++                layer_id, row_start, row_start + num_rows, local)
++    return local
++
++
++class DiskEngramTable:
++    """Tech2Wild/Kai 2026-09-10: read Engram rows straight from the safetensors
++    shards with positional preads on a thread pool, so the per-rank Engram
++    shard (~47 GiB at TP4) never occupies memory. Built for DGX Spark, where
++    "pinned host memory" is the same 128 GB pool the GPU uses. Rows are
++    dequantized on the CPU (fp8 e4m3 x ue8m0 block scales -> bf16) and copied
++    into the GPU staging buffer. Enable with DSV41_ENGRAM_DISK=1.
++    Lineage: our own PLE-on-disk patch for Qwen3.8-Flash-Next (2026-09-05).
++    """
++
++    def __init__(
++        self,
++        model_dir: str,
++        layer_id: int,
++        dim: int,
++        block_size: int,
++        row_start: int = 0,
++        num_rows: int | None = None,
++    ):
++        model_dir = _dsv41_engram_local_dir(model_dir, layer_id, row_start, num_rows)
++        idx_path = _kai_os.path.join(model_dir, "model.safetensors.index.json")
++        with open(idx_path) as f:
++            weight_map = _kai_json.load(f)["weight_map"]
++        wname = f"layers.{layer_id}.engram.embed.weight"
++        sname = f"layers.{layer_id}.engram.embed.scale"
++        self.w_fd, self.w_off, self.w_shape = self._open(model_dir, weight_map[wname], wname)
++        self.s_fd, self.s_off, self.s_shape = self._open(model_dir, weight_map[sname], sname)
++        self.dim = dim
++        self.sb = dim // block_size
++        assert self.w_shape[1] == dim, (self.w_shape, dim)
++        assert self.s_shape[1] == self.sb, (self.s_shape, self.sb)
++        assert self.s_shape[0] == self.w_shape[0], (self.s_shape, self.w_shape)
++        # The checkpoint holds the FULL table (every TP rank's hash heads) per layer,
++        # while callers pass rank-local row ids (global - vocab_start), so reads must
++        # start at this rank's first row.
++        if num_rows is None:
++            num_rows = self.w_shape[0] - row_start
++        assert 0 <= row_start and row_start + num_rows <= self.w_shape[0], (
++            row_start, num_rows, self.w_shape)
++        self.w_off += row_start * dim
++        self.s_off += row_start * self.sb
++        self.row_start = row_start
++        self.num_rows = num_rows
++        self.threads = _KAI_THREADS
++        self.chunk = _KAI_CHUNK
++        self.pool = _kai_pool()  # shared by all tables (was one pool per table)
++        logger.info(
++            "Engram DISK mode: layer %d rows [%d, %d) read from %s (off=%d) and %s (off=%d); "
++            "%d threads, chunk %d",
++            layer_id, row_start, row_start + num_rows, weight_map[wname], self.w_off,
++            weight_map[sname], self.s_off, self.threads, self.chunk,
++        )
++
++    @staticmethod
++    def _open(model_dir: str, fname: str, tname: str):
++        path = _kai_os.path.join(model_dir, fname)
++        fd = _kai_os.open(path, _kai_os.O_RDONLY)
++        try:
++            _kai_os.posix_fadvise(fd, 0, 0, _kai_os.POSIX_FADV_RANDOM)
++        except Exception:  # noqa: BLE001
++            pass
++        with open(path, "rb") as f:
++            n = _kai_struct.unpack("<Q", f.read(8))[0]
++            hdr = _kai_json.loads(f.read(n))
++        meta = hdr[tname]
++        start = meta["data_offsets"][0]
++        return fd, 8 + n + start, tuple(meta["shape"])
++
++    def _read_rows(self, fd: int, base: int, rel: list, row_bytes: int, buf) -> None:
++        _kai_parallel_read([(fd, base, rel, row_bytes, buf)])
++
++    def read_jobs(self, rel_l: list, w: torch.Tensor, s: torch.Tensor) -> list:
++        """Read jobs for rank-local rows `rel_l` into uint8 w [R, dim], s [R, sb]."""
++        return [
++            (self.w_fd, self.w_off, rel_l, self.dim, memoryview(w.numpy()).cast("B")),
++            (self.s_fd, self.s_off, rel_l, self.sb, memoryview(s.numpy()).cast("B")),
++        ]
++
++    def dequant(self, w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
++        """fp8 e4m3 rows (as uint8) x ue8m0 block scales -> [R, dim] fp32."""
++        R = w.shape[0]
++        vals = w.view(torch.float8_e4m3fn).to(torch.float32).view(
++            R, self.sb, self.dim // self.sb
++        )
++        # ue8m0 byte is the fp32 exponent field: 2^(e-127)
++        scale = (s.to(torch.int32) << 23).view(torch.float32)
++        return (vals * scale[:, :, None]).reshape(R, self.dim)
++
++    def gather_dequant(self, rel: torch.Tensor, owned: torch.Tensor) -> torch.Tensor:
++        """rel: [R] int64 CPU local row ids; owned: [R] bool. Returns [R, dim] bf16 CPU."""
++        return gather_dequant_many([(self, rel, owned)])[0]
++
++
++def gather_dequant_many(requests: list) -> list[torch.Tensor]:
++    """Tech2Wild/Kai 2026-09-10: requests = [(DiskEngramTable, rel [R] int64 CPU,
++    owned [R] bool)] -> one [R, dim] bf16 CPU tensor per request. Rows are
++    de-duplicated per table (repeated n-grams, zero-filled dummy batches) and the
++    reads of every table go out in ONE parallel batch. Same math as before."""
++    plans, jobs = [], []
++    for table, rel, owned in requests:
++        uniq, inverse = torch.unique(rel, return_inverse=True)
++        w = torch.empty((uniq.numel(), table.dim), dtype=torch.uint8)
++        s = torch.empty((uniq.numel(), table.sb), dtype=torch.uint8)
++        jobs += table.read_jobs(uniq.tolist(), w, s)
++        plans.append((table, w, s, inverse, owned))
++    _kai_parallel_read(jobs)
++    outs = []
++    for table, w, s, inverse, owned in plans:
++        out = table.dequant(w, s)[inverse]
++        out[~owned] = 0
++        outs.append(out.to(torch.bfloat16))
++    return outs
++
++
+ class ParallelEngramEmbedding(nn.Module):
+     """The n-gram hash table, sharded by complete hash heads over TP ranks.
+     Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
+@@ -698,8 +900,13 @@
+         head_sizes: tuple[int, ...],
+         block_size: int = 32,
+         cpu_offload: bool = False,
++        model_dir: str | None = None,
++        layer_id: int | None = None,
+     ):
+         super().__init__()
++        self.disk: DiskEngramTable | None = None
++        if _DSV41_ENGRAM_DISK:
++            cpu_offload = False
+         tp_size = get_tensor_model_parallel_world_size()
+         dp_size = get_engram_dp_size()
+         assert head_sizes and all(size > 0 for size in head_sizes)
+@@ -733,6 +940,23 @@
+         # Explicit device: model init runs under a `torch.device("cuda")`
+         # context, which would otherwise put the shard in HBM.
+         kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
++        if _DSV41_ENGRAM_DISK:
++            assert model_dir is not None and layer_id is not None
++            self.disk = DiskEngramTable(
++                model_dir, layer_id, dim, block_size,
++                row_start=self.vocab_start_idx, num_rows=self.part_num_embeddings,
++            )
++            # 1-row placeholders as BUFFERS (not Parameters): the checkpoint
++            # rows are skipped by the weights iterator and must not trip the
++            # "weights not initialized" check.
++            self.register_buffer("weight", torch.zeros(1, dim, dtype=torch.float8_e4m3fn, device="cpu"), persistent=False)
++            self.register_buffer("weight_scale_inv", torch.zeros(1, dim // block_size, dtype=torch.uint8, device="cpu"), persistent=False)
++            logger.info(
++                "Engram table DISK-backed: %d rows x %d per rank stay on disk (%.2f GiB not allocated)",
++                self.part_num_embeddings, dim,
++                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
++            )
++            return
+         self.weight = nn.Parameter(
+             torch.empty(
+                 self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
+@@ -793,6 +1017,9 @@
+         rows = indices.shape[0] * self.part_n_hash_cols
+         if not rows:
+             return
++        if self.disk is not None:
++            self._disk_lookup(indices, out)
++            return
+         weight, scales = self._storage()
+         # The table dwarfs TLB reach, so a persistent grid near the SM count
+         # beats one program per row; halve it to leave SMs for the main stream.
+@@ -817,6 +1044,42 @@
+             GRID=grid,
+         )
+ 
++    def disk_rel_owned(self, local: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """local: [T, <=L] int64 CPU hash ids of this rank's heads -> flat
++        (rel [T*L] rank-local row ids, owned [T*L] bool). Padded heads (beyond
++        TOTAL_HEADS) and ids outside this rank's range are not owned (zeros)."""
++        T = local.shape[0]
++        L = self.part_n_hash_cols
++        if local.shape[1] < L:
++            pad = torch.full((T, L - local.shape[1]), -1, dtype=torch.int64)
++            local = torch.cat([local, pad], dim=1)
++        rows = local.reshape(-1)
++        owned = (rows >= self.vocab_start_idx) & (rows < self.vocab_end_idx)
++        rel = torch.where(owned, rows - self.vocab_start_idx, torch.zeros_like(rows))
++        return rel, owned
++
++    def _disk_lookup(self, indices: torch.Tensor, out: torch.Tensor) -> None:
++        """Host-side gather + dequant for DISK mode, then H2D into `out`
++        ([T, local_heads, dim] bf16). Padded heads (beyond TOTAL_HEADS) and
++        rows outside this rank's range write zeros, matching the kernel.
++
++        In-forward fallback only (V1 runner / eager). Under the V2 runner the
++        rows are staged by EngramDiskStager before the forward instead."""
++        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                "Engram DISK lookup reached a CUDA-graph capture: it needs a host "
++                "round trip. Stage rows before the forward (EngramDiskStager, V2 "
++                "runner + patched nvidia/model_state.py) or run --enforce-eager."
++            )
++        T = indices.shape[0]
++        L = self.part_n_hash_cols
++        ids = indices.detach().to("cpu", dtype=torch.int64)
++        head_end = min(self.head_start + L, self.n_hash_cols)
++        rel, owned = self.disk_rel_owned(ids[:, self.head_start:head_end])
++        assert self.disk is not None
++        deq = self.disk.gather_dequant(rel, owned)
++        out[:T].copy_(deq.view(T, L, self.dim))
++
+     def forward(self, indices: torch.Tensor) -> torch.Tensor:
+         """indices: [num_tokens, n_hash_cols] -> [num_tokens, n_hash_cols, dim]
+         bf16, gathered from all shards for this replica's tokens."""
+@@ -1031,6 +1294,8 @@
+             layout.head_dim,
+             tuple(size for order in layout.primes[layer_hash_index] for size in order),
+             cpu_offload=engram_config.cpu_offload if engram_config else True,
++            model_dir=get_current_vllm_config().model_config.model,
++            layer_id=layout.layer_ids[layer_hash_index],
+         )
+         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
+         self.wkv = ReplicatedLinear(
+@@ -1052,9 +1317,15 @@
+ 
+         vllm_config = get_current_vllm_config()
+         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
++        # Under the V2 runner, disk rows are staged by EngramDiskStager before
++        # the forward so FULL and breakable graphs contain no host round trip.
++        self.prestage = self.embed_tokens.disk is not None and bool(
++            getattr(vllm_config, "use_v2_model_runner", False)
++        )
+         # Keep lookup results alive across breakable graph segments. A table
+-        # shared by DP replicas stages every replica's tokens at once.
+-        self.staged_rows = torch.empty(
++        # shared by DP replicas stages every replica's tokens at once. Zeroing
++        # also keeps graph-padding rows finite when disk prestaging is active.
++        self.staged_rows = torch.zeros(
+             max_tokens * self.embed_tokens.dp_size,
+             self.embed_tokens.part_n_hash_cols,
+             layout.head_dim,
+@@ -1078,6 +1349,8 @@
+         `hash_ids` covers every DP replica sharing the table (see
+         `gather_engram_hashes`), so only `embed` narrows back to this one.
+         """
++        if self.prestage:
++            return
+         rows = self._staged_rows_for_ubatch()[: hash_ids.shape[0]]
+         assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
+         self.embed_tokens.lookup(hash_ids, rows)
+@@ -1093,7 +1366,6 @@
+         slot = engram_gathered_num_tokens()
+         staged = self._staged_rows_for_ubatch()[: slot * dp_group.world_size]
+         return _gather_engram_rows(staged, num_tokens)
+-
+     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
+         """Gather heads, returning only local tokens when SP is enabled."""
+         if self.embed_tokens.dp_size > 1:
+@@ -1184,3 +1456,105 @@
+             num_warps=num_warps,
+         )
+         return output
++
++
++class EngramDiskStager:
++    """Tech2Wild/Kai 2026-09-10 (CUDA graphs): stage DISK-mode Engram rows
++    OUTSIDE the model forward.
++
++    The V2 model state calls :meth:`stage` from ``prepare_inputs`` once per
++    step, after the runner has written this step's input ids, positions and
++    query_start_loc (all on the current stream). It hashes the step on the GPU
++    (same kernel, same inputs as the forward), copies only this rank's hash
++    columns to pinned host memory, waits on ONE event, reads every row of every
++    engram layer in one parallel batch, dequantizes on the CPU exactly like the
++    in-forward path, and copies (async, from pinned memory) into each layer's
++    persistent ``staged_rows``. The forward (eager, breakable PIECEWISE or FULL
++    graph) only reads ``staged_rows``, so it never needs the host.
++    """
++
++    def __init__(self, hash_state: NgramHashState, engrams: list["Engram"]) -> None:
++        assert engrams and all(e.embed_tokens.disk is not None for e in engrams)
++        self.hash_state = hash_state
++        self.engrams = sorted(engrams, key=lambda e: e.layer_hash_index)
++        emb = self.engrams[0].embed_tokens
++        self.local_heads = emb.part_n_hash_cols
++        self.head_start = emb.head_start
++        self.head_end = min(emb.head_start + emb.part_n_hash_cols, emb.n_hash_cols)
++        self.dim = emb.dim
++        self.max_tokens = self.engrams[0].staged_rows.shape[0]
++        num_layers = hash_state.multipliers.shape[0]
++        self.hash_host = torch.empty(
++            (self.max_tokens, num_layers, self.head_end - self.head_start),
++            dtype=torch.int32,
++            device="cpu",
++            pin_memory=True,
++        )
++        self.rows_host = [
++            torch.empty(
++                (self.max_tokens, self.local_heads, self.dim),
++                dtype=torch.bfloat16,
++                device="cpu",
++                pin_memory=True,
++            )
++            for _ in self.engrams
++        ]
++        self.hashes_ready = torch.cuda.Event()
++        self.num_staged = 0
++        logger.info(
++            "Engram DISK rows staged before the forward (graph-safe): %d layers, "
++            "heads [%d, %d) of %d, up to %d tokens/step, %d read threads",
++            len(self.engrams),
++            self.head_start,
++            self.head_end,
++            emb.n_hash_cols,
++            self.max_tokens,
++            _KAI_THREADS,
++        )
++
++    @torch.inference_mode()
++    def stage(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        lookback_token_ids: torch.Tensor,
++        num_tokens: int,
++    ) -> int:
++        """Stage rows for the first `num_tokens` (unpadded) tokens of this step.
++        Returns the number staged; 0 while the KV cache is unbound (profiling),
++        matching the forward, which skips engram then."""
++        n = min(int(num_tokens), self.max_tokens)
++        if n <= 0 or not self.hash_state.ensure_cache():
++            return 0
++        from .mm_preprocess import image_sentinel_mask
++
++        ids = input_ids[:n]
++        hashes = self.hash_state(
++            ids,
++            positions[:n],
++            query_start_loc,
++            image_sentinel_mask(ids),
++            lookback_token_ids,
++            image_sentinel_mask(lookback_token_ids),
++            None,
++            None,
++        )
++        host = self.hash_host[:n]
++        host.copy_(hashes[:, :, self.head_start : self.head_end], non_blocking=True)
++        self.hashes_ready.record()
++        # The one host sync per step. It also orders this step's rewrite of the
++        # pinned buffers after the previous step's async H2D copies from them.
++        self.hashes_ready.synchronize()
++        requests = []
++        for engram in self.engrams:
++            local = host[:, engram.layer_hash_index, :].to(torch.int64)
++            rel, owned = engram.embed_tokens.disk_rel_owned(local)
++            requests.append((engram.embed_tokens.disk, rel, owned))
++        rows_per_layer = gather_dequant_many(requests)
++        for engram, rows, buf in zip(self.engrams, rows_per_layer, self.rows_host):
++            staged = buf[:n]
++            staged.copy_(rows.view(n, self.local_heads, self.dim))
++            engram.staged_rows[:n].copy_(staged, non_blocking=True)
++        self.num_staged = n
++        return n
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -6,6 +6,11 @@
+ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig
++from vllm.models.deepseek_v4_1.common.engram import (
++    Engram,
++    EngramDiskStager,
++    NgramHashState,
++)
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+@@ -67,6 +72,17 @@
+                 (self.max_num_reqs, depth), -1, dtype=torch.int32, device=device
+             )
+ 
++        # Tech2Wild/Kai 2026-09-10 (CUDA graphs): DISK-backed Engram rows are
++        # staged in prepare_inputs, outside the (possibly captured) forward.
++        self.engram_stager: EngramDiskStager | None = None
++        engrams = [m for m in model.modules() if isinstance(m, Engram) and m.prestage]
++        if engrams:
++            hash_states = [m for m in model.modules() if isinstance(m, NgramHashState)]
++            assert len(hash_states) == 1, (
++                f"expected one NgramHashState, found {len(hash_states)}"
++            )
++            self.engram_stager = EngramDiskStager(hash_states[0], engrams)
++
+     def prepare_inputs(
+         self, input_batch: InputBatch, req_states: RequestState
+     ) -> dict[str, torch.Tensor | None]:
+@@ -87,6 +103,17 @@
+             BLOCK_DEPTH=triton.next_power_of_2(depth),
+         )
+         model_inputs["lookback_token_ids"] = window
++        if self.engram_stager is not None and input_batch.input_ids is not None:
++            # After the runner wrote this step's ids/positions/query_start_loc
++            # and the lookback window above; before the forward / graph replay.
++            positions = model_inputs.get("positions")
++            self.engram_stager.stage(
++                input_batch.input_ids,
++                positions if positions is not None else input_batch.positions,
++                input_batch.query_start_loc[: input_batch.num_reqs + 1],
++                window,
++                input_batch.num_tokens,
++            )
+         return model_inputs
+ 
+     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -9,6 +9,8 @@
+ import hashlib
+ import json
+ import os
++
++_DSV41_ENGRAM_DISK = os.environ.get("DSV41_ENGRAM_DISK", "0") == "1"
+ import tempfile
+ import threading
+ import time
+@@ -964,6 +966,10 @@
+                 for name in f.keys():  # noqa: SIM118
+                     if should_skip_weight(name, local_expert_ids):
+                         continue
++                    # Tech2Wild/Kai 2026-09-10: DSV41_ENGRAM_DISK=1 leaves the
++                    # Engram tables on disk (see deepseek_v4_1/common/engram.py)
++                    if _DSV41_ENGRAM_DISK and name.endswith((".engram.embed.weight", ".engram.embed.scale")):
++                        continue
+                     param = f.get_tensor(name)
+                     yield name, param
+ 
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -453,7 +453,9 @@
+             prefix=f"{prefix}.swa_cache",
+             cache_config=cache_config,
+             backend_cls=self.swa_backend_cls,
+-            block_size=32,
++            # Tech2Wild/Kai 2026-09-10: page size is a property of the SWA decode
++            # kernel (FlashInfer SM120 sparse-MLA kernels are 64-token pages).
++            block_size=getattr(self.swa_backend_cls, "get_swa_block_size", lambda: 32)(),
+         )
+ 
+         # The attention layer itself was already registered with the
+@@ -938,8 +940,13 @@
+         # alignment; plain bf16 / per-tensor fp8 rows use natural element-size
+         # pages.
+         uses_fp8_ds_mla_layout = self.kv_cache_dtype == "fp8_ds_mla"
++        # Tech2Wild/Kai 2026-09-10: SM120 FlashInfer sparse-MLA kernels are
++        # instantiated for 64-STATE compressed pages, so a kv-source layer's page
++        # is 64 * compress_ratio tokens there (ratio 1 -> 64, ratio 2 -> 128).
++        _hook = getattr(self.backend_cls, "get_compressed_block_size", None)
++        _bs = _hook(self.compress_ratio) if _hook is not None else None
+         return MLAAttentionSpec(
+-            block_size=vllm_config.cache_config.block_size,
++            block_size=_bs or vllm_config.cache_config.block_size,
+             num_kv_heads=1,
+             head_size=self.head_dim,
+             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
+@@ -963,6 +970,21 @@
+         return source.kv_cache
+ 
+ 
++def _dsv41_indexer_sm12x() -> bool:
++    from vllm.platforms import current_platform
++
++    return current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++
++
++class DeepseekV4IndexerSM12xBackend(DeepseekV4IndexerBackend):
++    """Tech2Wild 2026-09-10: SM12x indexer pages hold 64 states (64 tokens at
++    compress ratio 1, 128 at ratio 2), so both sizes are kernel block sizes."""
++
++    @staticmethod
++    def get_supported_kernel_block_sizes() -> list[int]:
++        return [128, 64]
++
++
+ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
+     def __init__(
+         self,
+@@ -992,8 +1014,14 @@
+         # head_dim already carries the fp8 scale padding
+         # tokens_per_state=1 for V3.2, >1 for DeepseekV4; same cache layout.
+         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
++        # Tech2Wild 2026-09-10 (SM12x): DeepGEMM's paged MQA logits (indexer decode)
++        # takes 32 or 64 states per block, and the indexer metadata builder passes
++        # this spec's num_states, so pages hold 64 states = 64 * compress_ratio tokens.
++        block_size = self.cache_config.block_size
++        if _dsv41_indexer_sm12x():
++            block_size = 64 * max(1, self.compress_ratio)
+         return MLAAttentionSpec(
+-            block_size=self.cache_config.block_size,
++            block_size=block_size,
+             num_kv_heads=1,
+             head_size=self.head_dim,
+             dtype=self.dtype,
+@@ -1005,6 +1033,8 @@
+     def forward(self): ...
+ 
+     def get_attn_backend(self) -> type[AttentionBackend]:
++        if _dsv41_indexer_sm12x():
++            return DeepseekV4IndexerSM12xBackend
+         return DeepseekV4IndexerBackend
+ 
+ 
+--- a/vllm/models/deepseek_v4_1/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v4_1/nvidia/flashinfer_sparse.py
+@@ -24,6 +24,7 @@
+     DeepseekV4SparseMLAMetadataBuilder,
+     DeepseekV41SparseSWAMetadataBuilder,
+ )
++from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
+ from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+ from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
+@@ -110,8 +111,22 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
++        # Tech2Wild/Kai 2026-09-10 (SM12x): 64-state compressed pages, so a
++        # ratio-1 kv-source layer needs 64-token pages (128 stays first so the
++        # cache-config default remains 128 for ratio-2 layers).
++        if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
++            return [128, 64]
+         return [128]
+ 
++    @classmethod
++    def get_compressed_block_size(cls, compress_ratio: int) -> int | None:
++        """Tech2Wild/Kai 2026-09-10: tokens per compressed-KV page for a kv-source
++        layer on SM12x (FlashInfer SM120 sparse-MLA prefill/decode kernels are
++        instantiated for 64-state pages); None = use cache_config.block_size."""
++        if compress_ratio > 0 and current_platform.is_cuda() and current_platform.is_device_capability_family(120):
++            return 64 * compress_ratio
++        return None
++
+     @staticmethod
+     def get_name() -> str:
+         return "FLASHINFER_MLA_SPARSE_DSV41"
+@@ -190,6 +205,26 @@
+         return DeepseekSparseSWAFlashInferMetadataBuilder
+ 
+ 
++class DeepseekSparseSWAFlashInferSM120Backend(DeepseekSparseSWAFlashInferBackend):
++    """Tech2Wild/Kai 2026-09-10: SM12x. FlashInfer's SM120 sparse-MLA decode and
++    prefill kernels are instantiated only for 64-token pages
++    (_DECODE_DSV4_PAGE_BLOCK_SIZE = 64); the base backend's "any multiple of 32"
++    made vLLM build the SWA cache at 32-token pages, which the SM120 path rejects
++    ("no decode kernel for this shape ... page_block_size=32")."""
++
++    @staticmethod
++    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
++        return [64]
++
++    @classmethod
++    def get_preferred_block_size(cls, default_block_size: int) -> int:
++        return 64
++
++    @classmethod
++    def get_swa_block_size(cls) -> int:
++        return 64
++
++
+ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+     """FlashInfer TRTLLM-gen sparse MLA attention layer for SM100 DeepSeek V4."""
+ 
+@@ -543,7 +578,7 @@
+     """DeepSeek V4 sparse MLA attention through FlashInfer's SM120 kernels."""
+ 
+     backend_cls = DeepseekV4FlashInferMLASparseBackend
+-    swa_backend_cls = DeepseekSparseSWAFlashInferBackend
++    swa_backend_cls = DeepseekSparseSWAFlashInferSM120Backend
+     use_fp8_ds_mla_layout: ClassVar[bool] = True
+ 
+     @staticmethod
+--- a/vllm/v1/attention/backends/mla/sparse_swa.py
++++ b/vllm/v1/attention/backends/mla/sparse_swa.py
+@@ -139,6 +139,13 @@
+         return [MultipleOf(32)]
+ 
+     @classmethod
++    def get_swa_block_size(cls) -> int:
++        """Tech2Wild/Kai 2026-09-10: tokens per SWA cache page handed to
++        DeepseekV4SWACache. FlashMLA / TRTLLM-gen take the page size at
++        runtime (32); kernels instantiated for one page size override this."""
++        return 32
++
++    @classmethod
+     def get_preferred_block_size(cls, default_block_size: int) -> int:
+         return 256
+ 
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -694,10 +694,13 @@
+             and current_platform.has_device_capability(90)
+             and not current_platform.is_device_capability_family(120)
+         )
+-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
+-            512,
+-            1024,
+-            2048,
++        # Tech2Wild 2026-09-10 (SM12x): GB10 has 48 SMs and 99 KB smem per block. On long
++        # rows persistent_topk oversubscribes and its FilteredTopK fallback needs >=128 KB
++        # smem, so the launch fails (32K context: 90 CTAs > 48). Use top_k_per_row_decode.
++        use_persistent_topk = (
++            current_platform.is_cuda()
++            and topk_tokens in (512, 1024, 2048)
++            and not current_platform.is_device_capability_family(120)
+         )
+         if use_cooperative_topk:
+             workspace_manager = current_workspace_manager()
